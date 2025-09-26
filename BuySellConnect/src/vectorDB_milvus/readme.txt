@@ -15,8 +15,10 @@ set up of docker and milvus in local set up
    # Check if containers are running
    docker-compose ps
 3. This link has more instructions https://www.perplexity.ai/search/i-want-to-have-a-large-scale-v-PxqreahdRR2j_ZJqXh3i1g#0
-4. Once you get milvus db working in docker, you can run the code below to interactively insert or fetch data
+4. install all python packages from requirements.txt
+5. Once you get milvus db working in docker, you can run the code below to interactively insert or fetch data
    python milvus_setup_and_test_interactive.py
+
 
 
 
