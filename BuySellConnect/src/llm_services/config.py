@@ -19,21 +19,28 @@ class Settings(BaseSettings):
         env_file_encoding='utf-8',
         case_sensitive=False,
         env_prefix="",
-        #extra="forbid"  # This prevents the extra_forbidden error
+        extra="ignore"  # Ignore extra fields to prevent validation errors
     )
     
+    # Database Settings
+    sql_database_url: str = Field(
+        default="sqlite:///chat_history.db",
+        description="SQLAlchemy connection string for chat history database"
+    )
+
     # API Configuration
     app_name: str = Field(default="Item Metadata Extractor API", description="Application name")
     app_version: str = Field(default="1.0.0", description="Application version")
+    app_env: str = Field(default="development", description="Application environment")
     debug: bool = Field(default=False, description="Debug mode")
-    
+
     # Server Configuration
     host: str = Field(default="0.0.0.0", description="Server host")
     port: int = Field(default=8000, description="Server port")
     reload: bool = Field(default=False, description="Auto-reload on changes (development only)")
-    
+
     # OpenAI Configuration
-    openai_api_key: str = Field(..., description="OpenAI API key")
+    openai_api_key: str = Field(default="", description="OpenAI API key")
     openai_model_name: str = Field(default="gpt-4o-mini", description="OpenAI model to use")
     openai_temperature: float = Field(default=0.0, ge=0.0, le=1.0, description="Model temperature")
     openai_max_retries: int = Field(default=3, ge=1, le=10, description="Max API retries")
@@ -62,7 +69,10 @@ class Settings(BaseSettings):
     def validate_openai_key(cls, v):
         """Validate OpenAI API key format"""
         if not v:
-            raise ValueError("OpenAI API key is required")
+            # Allow empty key for development/testing but warn
+            import warnings
+            warnings.warn("OpenAI API key is not set. Some features may not work.")
+            return v
         if not v.startswith('sk-'):
             raise ValueError("OpenAI API key must start with 'sk-'")
         return v

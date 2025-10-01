@@ -1,28 +1,73 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 import logging
 from typing import List
 import os
+from contextlib import asynccontextmanager
 
-# We'll import these from other files in the next steps
-from models import ItemRequest, ItemResponse
+# Import models and services
+from models import ItemRequest, ItemResponse, MessageRequest, MessageResponse, ErrorResponse
 from services import ItemMetadataService
-from config import get_settings
 
-# For now, define models here (we'll move these to models.py later)
-class ItemRequest(BaseModel):
-    item: str = Field(..., description="Name of the item to analyze", min_length=1, max_length=200)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class ItemResponse(BaseModel):
-    item_type: str = Field(description="Typically this the same as item but sometimes if the item is too specific like Mahindra Thar, the item type is SUV")
-    category: str = Field(description="What is the category of this input item? Example if Item is Mahindra Thar, this could be car.")
-    super_category: str = Field(description="What is the category of this input item? Example if Item is Fridge, category is Household Appliance.")
-    attributes: List[str] = Field(description="Typical list of attributes for the input Item. This could be built by looking at the typical specification for this item.")
+# Global variables to store initialized services
+langchain_service = None
+chat_history_service = None
 
-class ErrorResponse(BaseModel):
-    detail: str
-    error_type: str
+
+# Models are imported from models.py
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Startup
+    global langchain_service, chat_history_service
+
+    logger.info("Starting up Item Metadata Extractor API...")
+
+    try:
+        # Initialize chat history service
+        try:
+            from services import ChatHistoryService
+            chat_history_service = ChatHistoryService()
+            logger.info("Chat history service initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize chat history service: {e}")
+            # Don't raise here, continue with langchain service
+
+        # Check for OpenAI API key
+        openai_key = os.getenv("OPENAI_API_KEY")
+        print(os.getenv("OPENAI_MODEL_NAME"))
+
+        print("_________________________")
+        print(f"OpenAI Key: {openai_key}")
+        if not openai_key:
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+
+        # Create config dictionary
+        config = {
+            "openai_api_key": openai_key,
+            "model_name": os.getenv("OPENAI_MODEL_NAME", "random_model"), #"gpt-4o-mini"),
+            "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0")),
+            "max_retries": int(os.getenv("MAX_RETRIES", "3")),
+            "timeout_seconds": int(os.getenv("TIMEOUT_SECONDS", "30"))
+        }
+
+        logger.info("Initializing LangChain service...")
+        langchain_service = ItemMetadataService(config)
+        logger.info("LangChain service initialized successfully")
+
+    except Exception as e:
+        logger.error(f"Failed to start up API: {str(e)}")
+        raise e
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down Item Metadata Extractor API...")
+    # Add any cleanup code here if needed
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -30,7 +75,8 @@ app = FastAPI(
     description="Extract category and attributes for items using AI",
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
@@ -41,83 +87,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Global variable to store the initialized chain
-# This will be set up during startup
-langchain_service = None
-
-# @app.on_event("startup")
-# async def startup_event():
-#     """Initialize the LangChain service when the app starts"""
-#     global langchain_service
-    
-#     logger.info("Starting up Item Metadata Extractor API...")
-    
-#     try:
-#         # Check for OpenAI API key
-#         openai_key = os.getenv("OPENAI_API_KEY")
-#         if not openai_key:
-#             raise ValueError("OPENAI_API_KEY environment variable is required")
-        
-#         # Initialize the LangChain service (we'll create this class in services.py)
-#         # For now, this is a placeholder
-#         logger.info("Initializing LangChain service...")
-#         langchain_service = ItemMetadataService(openai_key)
-#         logger.info("LangChain service initialized successfully")
-        
-#         logger.info("API startup completed successfully")
-        
-#     except Exception as e:
-#         logger.error(f"Failed to start up API: {str(e)}")
-#         raise e
-
-
-from services import create_metadata_service
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the LangChain service when the app starts"""
-    global langchain_service
-    
-    logger.info("Starting up Item Metadata Extractor API...")
-    
-    try:
-        # Check for OpenAI API key
-        openai_key = os.getenv("OPENAI_API_KEY")
-        print(os.getenv("OPENAI_MODEL_NAME"))
-
-        print("_________________________")
-        print(f"OpenAI Key: {openai_key}")
-        if not openai_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required")
-            
-        # Create config dictionary
-        config = {
-            "openai_api_key": openai_key,
-            "model_name": os.getenv("OPENAI_MODEL_NAME", "random_model"), #"gpt-4o-mini"),
-            "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0")),
-            "max_retries": int(os.getenv("MAX_RETRIES", "3")),
-            "timeout_seconds": int(os.getenv("TIMEOUT_SECONDS", "30"))
-        }
-        
-        logger.info("Initializing LangChain service...")
-        langchain_service = ItemMetadataService(config)
-        logger.info("LangChain service initialized successfully")
-        
-    except Exception as e:
-        logger.error(f"Failed to start up API: {str(e)}")
-        raise e
-
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup when the app shuts down"""
-    logger.info("Shutting down Item Metadata Extractor API...")
 
 # Health check endpoint
 @app.get("/health")
@@ -209,11 +178,33 @@ async def extract_metadata_batch(items: List[str]):
 async def root():
     """Root endpoint with basic API information"""
     return {
-        "message": settings.app_name,
-        "version": settings.app_version,
+        "message": "Item Metadata Extractor API",
+        "version": "1.0.0",
         "docs": "/docs",
         "health": "/health"
     }
+
+# Add the new endpoint
+@app.post("/process-message", response_model=MessageResponse)
+async def process_message(request: MessageRequest):
+    """Process message using ChatHistoryService with LLM-based similarity detection"""
+    try:
+        # Use the global chat_history_service if available, otherwise create a new instance
+        if chat_history_service is not None:
+            return await chat_history_service.process_message(request)
+        else:
+            # Fallback: create a temporary service instance
+            logger.warning("Global chat_history_service is None, creating temporary instance")
+            from services import ChatHistoryService
+            temp_service = ChatHistoryService()
+            return await temp_service.process_message(request)
+
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process message: {str(e)}"
+        )
 
 # Run the application
 if __name__ == "__main__":

@@ -1,7 +1,25 @@
+# Standard library imports
 import logging
-from typing import Dict, Any, Optional
 import os
+from typing import Any, Dict, List, Optional
+
+# Third-party imports
 from pydantic import ValidationError
+
+# LangChain imports
+from langchain_core.chat_history import BaseChatMessageHistory 
+# For ChatMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+
+# For SQLChatMessageHistory
+from langchain_community.chat_message_histories import SQLChatMessageHistory
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+#from langchain.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain.schema.runnable import RunnableLambda
+
 
 # LangChain imports - using updated import paths
 try:
@@ -10,14 +28,247 @@ except ImportError:
     # Fallback to older import for compatibility
     from langchain.chat_models import ChatOpenAI
 
-from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser
 from langchain.schema import BaseOutputParser
 
 # Import our models
-from models import ItemResponse, ServiceConfig
+from models import ItemResponse, ServiceConfig, MessageRequest, MessageResponse
+from config import get_langchain_config, get_settings
 
-from config import get_langchain_config
+class ChatHistoryService:
+    def __init__(self):
+        self.settings = get_settings()
+        self._setup_llm_chain()
+
+    def _setup_llm_chain(self):
+        """Set up the LLM chain with conversation history"""
+        # Check if OpenAI API key is available
+        if not self.settings.openai_api_key:
+            raise ValueError("OpenAI API key is required for ChatHistoryService. Please set OPENAI_API_KEY environment variable.")
+
+        # Initialize the ChatGPT model
+        self.chatgpt = ChatOpenAI(
+            model_name=self.settings.openai_model_name or "gpt-4o-mini",
+            temperature=0.7,
+            openai_api_key=self.settings.openai_api_key
+        )
+
+        # Create prompt template with history placeholder for main conversation
+        self.prompt_template = ChatPromptTemplate.from_messages([
+            ("system", "Act as a helpful AI Assistant"),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{human_input}"),
+        ])
+
+        # Create prompt template for message similarity judgment
+        self.similarity_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a message similarity judge. Given a new user message and a list of previous messages from the conversation history, determine which (if any) previous messages are contextually similar or related to the new message. If the new message is a statement without intent and could apply to the subject of more than one message in history, make sure that you return "similar_count:multiple". If the sentence begins with "it" or "they" followed by must or should then again you need to ask for clarification from the history if it exists.
+
+Rules:
+1. If EXACTLY ONE previous message is similar/related to the new message, return: "similar_count:1" followed by that message
+2. If MORE THAN ONE previous message is similar/related to the new message, return: "similar_count:multiple" followed by all similar messages, each on a new line
+3. If NO previous messages are similar/related to the new message, return: "similar_count:none"
+
+Consider messages similar if they:
+- Ask about the same topic or subject
+- Are follow-up questions to the same conversation thread
+- Reference the same entities, concepts, or problems
+- Are variations of the same question
+
+Do not give any response more than 1 sentence of no more than 15 words.
+
+Previous messages from history:
+{previous_messages}
+
+New user message: {new_message}"""),
+            ("human", "Analyze the similarity and provide your judgment:")
+        ])
+
+        # Create basic LLM chain with memory buffer window
+        self.llm_chain = (
+            RunnablePassthrough.assign(history=lambda x: self._memory_buffer_window(x["history"], -1))
+            | self.prompt_template
+            | self.chatgpt
+        )
+
+        # Create similarity judgment chain
+        self.similarity_chain = self.similarity_prompt | self.chatgpt
+
+        # Create conversation chain with message history
+        self.conv_chain = RunnableWithMessageHistory(
+            self.llm_chain,
+            self._get_session_history_db,
+            input_messages_key="human_input",
+            history_messages_key="history",
+        )
+
+    def _get_session_history_db(self, session_id: str):
+        """Used to retrieve conversation history from database based on session ID"""
+        return SQLChatMessageHistory(session_id, self.settings.sql_database_url or "sqlite:///memory.db")
+
+    def _memory_buffer_window(self, messages, k=2):
+        """Create a memory buffer window function to return the last K conversations"""
+        if not messages:
+            return []
+        if k < 0:
+            return messages  # Return whole history when k is negative
+        return messages[-(k+1):]
+
+    def _get_history(self, session_id: str) -> SQLChatMessageHistory:
+        """Get or create chat history for a session"""
+        return SQLChatMessageHistory(
+            session_id=session_id,
+            connection=self.settings.sql_database_url
+        )
+
+    def _judge_message_similarity(self, new_message: str, previous_messages: List[str]) -> Dict:
+        """Use LLM to judge similarity between new message and previous messages"""
+        if not previous_messages:
+            return {"similar_count": "none", "similar_messages": []}
+
+        # Format previous messages for the prompt
+        formatted_messages = "\n".join([f"{i+1}. {msg}" for i, msg in enumerate(previous_messages)])
+
+        try:
+            # Use the similarity chain to get LLM judgment
+            response = self.similarity_chain.invoke({
+                "previous_messages": formatted_messages,
+                "new_message": new_message
+            })
+
+            response_text = response.content if hasattr(response, 'content') else str(response)
+
+            # Parse the LLM response
+            if "similar_count:1" in response_text:
+                # Extract the similar message
+                lines = response_text.split('\n')
+                similar_msg = None
+                for line in lines:
+                    if line.strip() and not line.startswith("similar_count:"):
+                        similar_msg = line.strip()
+                        break
+
+                return {
+                    "similar_count": "1",
+                    "similar_messages": [similar_msg] if similar_msg else []
+                }
+
+            elif "similar_count:multiple" in response_text:
+                # Extract all similar messages
+                lines = response_text.split('\n')
+                similar_msgs = []
+                for line in lines:
+                    if line.strip() and not line.startswith("similar_count:"):
+                        similar_msgs.append(line.strip())
+
+                return {
+                    "similar_count": "multiple",
+                    "similar_messages": similar_msgs
+                }
+
+            else:  # similar_count:none
+                return {"similar_count": "none", "similar_messages": []}
+
+        except Exception as e:
+            logger.error(f"Error in LLM similarity judgment: {str(e)}")
+            return {"similar_count": "none", "similar_messages": []}
+
+    async def process_message(self, request: MessageRequest) -> MessageResponse:
+        """Process a new message using LLM as judge for similarity detection"""
+        try:
+            history = self._get_history(request.session_id)
+
+            # Get previous human messages from history
+            previous_messages = history.messages
+            human_messages = [msg.content for msg in previous_messages if msg.type == "human"]
+
+            # Use LLM to judge similarity
+            similarity_result = self._judge_message_similarity(request.message, human_messages)
+
+            # Process based on similarity judgment
+            if similarity_result["similar_count"] == "1":
+                # Exactly one similar message found - no clarification needed
+                needs_clarification = "false"
+                similar_messages = [{"message": msg} for msg in similarity_result["similar_messages"]]
+
+            elif similarity_result["similar_count"] == "multiple":
+                # Multiple similar messages - clarification needed
+                needs_clarification = "true"
+                similar_messages = [{"message": msg} for msg in similarity_result["similar_messages"]]
+
+                clarification_msg = "I found multiple similar messages in our history. Are you referring to any of these?\n"
+                for idx, msg in enumerate(similarity_result["similar_messages"], 1):
+                    clarification_msg += f"{idx}. {msg}\n"
+
+                return MessageResponse(
+                    response=clarification_msg,
+                    similar_messages=similar_messages,
+                    needs_clarification="true"
+                )
+
+            else:  # similarity_result["similar_count"] == "none"
+                # No similar messages - new thread
+                needs_clarification = "new_thread"
+                similar_messages = []
+
+            # Process message using LLM chain with conversation history
+            try:
+                # Use the conversation chain to get AI response with history context
+                response = self.conv_chain.invoke(
+                    {"human_input": request.message},
+                    config={'configurable': {'session_id': request.session_id}}
+                )
+
+                # Extract the content from the response
+                ai_response = response.content if hasattr(response, 'content') else str(response)
+
+                return MessageResponse(
+                    response=ai_response,
+                    similar_messages=similar_messages,
+                    needs_clarification=needs_clarification
+                )
+
+            except Exception as llm_error:
+                logger.error(f"LLM processing error: {str(llm_error)}")
+                # Fallback response - still add to history for consistency
+                ai_response = f"I encountered an issue processing your message. Please try again. Error: {str(llm_error)}"
+
+                history.add_user_message(request.message)
+                history.add_ai_message(ai_response)
+
+                return MessageResponse(
+                    response=ai_response,
+                    similar_messages=similar_messages,
+                    needs_clarification=needs_clarification
+                )
+
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}")
+            raise
+
+    def chat_with_llm(self, prompt: str, session_id: str):
+        """
+        Utility function to chat with LLM and stream results live back to the user.
+
+        Args:
+            prompt: User input prompt
+            session_id: Session ID for conversation history
+
+        Yields:
+            Streamed response chunks from the LLM
+        """
+        try:
+            for chunk in self.conv_chain.stream(
+                {"human_input": prompt},
+                {'configurable': {'session_id': session_id}}
+            ):
+                if hasattr(chunk, 'content'):
+                    yield chunk.content
+                else:
+                    yield str(chunk)
+        except Exception as e:
+            logger.error(f"Error in streaming chat: {str(e)}")
+            yield f"Error: {str(e)}"
 
 # Configure logging
 logger = logging.getLogger(__name__)

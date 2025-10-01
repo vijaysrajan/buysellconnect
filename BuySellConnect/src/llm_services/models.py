@@ -1,6 +1,25 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, field_validator
 from typing import List, Optional
 import re
+
+class MessageRequest(BaseModel):
+    user_id: str = Field(..., description="Unique identifier for the user")
+    message: str = Field(..., description="User's message to process")
+    session_id: str = Field(..., description="Session identifier for chat history")
+
+class MessageResponse(BaseModel):
+    response: str = Field(..., description="AI response to the message")
+    similar_messages: List[dict] = Field(default_factory=list, description="Similar messages from history")
+    needs_clarification: str = Field(default="false", description="Clarification status: 'false', 'true', or 'new_thread'")
+
+    @field_validator('needs_clarification')
+    @classmethod
+    def validate_needs_clarification(cls, v):
+        """Ensure needs_clarification has valid values"""
+        valid_values = {"false", "true", "new_thread"}
+        if v not in valid_values:
+            raise ValueError(f"needs_clarification must be one of: {valid_values}")
+        return v
 
 class ItemRequest(BaseModel):
     """Request model for item metadata extraction"""
